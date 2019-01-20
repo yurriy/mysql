@@ -1,45 +1,40 @@
 //
-// WebSocketServer.cpp
+// TimeServer.cpp
 //
-// This sample demonstrates the WebSocket class.
+// This sample demonstrates the TCPServer and ServerSocket classes.
 //
-// Copyright (c) 2012, Applied Informatics Software Engineering GmbH.
+// Copyright (c) 2005-2006, Applied Informatics Software Engineering GmbH.
 // and Contributors.
 //
 // SPDX-License-Identifier:	BSL-1.0
 //
 
 
-#include "Poco/Net/HTTPServer.h"
-#include "Poco/Net/HTTPRequestHandler.h"
-#include "Poco/Net/HTTPRequestHandlerFactory.h"
-#include "Poco/Net/HTTPServerParams.h"
-#include "Poco/Net/HTTPServerRequest.h"
-#include "Poco/Net/HTTPServerResponse.h"
-#include "Poco/Net/HTTPServerParams.h"
+#include "Poco/Net/TCPServer.h"
+#include "Poco/Net/TCPServerConnection.h"
+#include "Poco/Net/TCPServerConnectionFactory.h"
+#include "Poco/Net/TCPServerParams.h"
+#include "Poco/Net/StreamSocket.h"
 #include "Poco/Net/ServerSocket.h"
-#include "Poco/Net/WebSocket.h"
-#include "Poco/Net/NetException.h"
+#include "Poco/Timestamp.h"
+#include "Poco/DateTimeFormatter.h"
+#include "Poco/DateTimeFormat.h"
+#include "Poco/Exception.h"
 #include "Poco/Util/ServerApplication.h"
 #include "Poco/Util/Option.h"
 #include "Poco/Util/OptionSet.h"
 #include "Poco/Util/HelpFormatter.h"
-#include "Poco/Format.h"
 #include <iostream>
 
 
 using Poco::Net::ServerSocket;
-using Poco::Net::WebSocket;
-using Poco::Net::WebSocketException;
-using Poco::Net::HTTPRequestHandler;
-using Poco::Net::HTTPRequestHandlerFactory;
-using Poco::Net::HTTPServer;
-using Poco::Net::HTTPServerRequest;
-using Poco::Net::HTTPResponse;
-using Poco::Net::HTTPServerResponse;
-using Poco::Net::HTTPServerParams;
+using Poco::Net::StreamSocket;
+using Poco::Net::TCPServerConnection;
+using Poco::Net::TCPServerConnectionFactory;
+using Poco::Net::TCPServer;
 using Poco::Timestamp;
-using Poco::ThreadPool;
+using Poco::DateTimeFormatter;
+using Poco::DateTimeFormat;
 using Poco::Util::ServerApplication;
 using Poco::Util::Application;
 using Poco::Util::Option;
@@ -47,153 +42,84 @@ using Poco::Util::OptionSet;
 using Poco::Util::HelpFormatter;
 
 
-class PageRequestHandler: public HTTPRequestHandler
-    /// Return a HTML document with some JavaScript creating
-    /// a WebSocket connection.
+class TimeServerConnection: public TCPServerConnection
+    /// This class handles all client connections.
+    ///
+    /// A string with the current date and time is sent back to the client.
 {
 public:
-    void handleRequest(HTTPServerRequest& request, HTTPServerResponse& response)
+    TimeServerConnection(const StreamSocket& s, const std::string& format):
+        TCPServerConnection(s),
+        _format(format)
     {
-        response.setChunkedTransferEncoding(true);
-        response.setContentType("text/html");
-        std::ostream& ostr = response.send();
-        ostr << "<html>";
-        ostr << "<head>";
-        ostr << "<title>WebSocketServer</title>";
-        ostr << "<script type=\"text/javascript\">";
-        ostr << "function WebSocketTest()";
-        ostr << "{";
-        ostr << "  if (\"WebSocket\" in window)";
-        ostr << "  {";
-        ostr << "    var ws = new WebSocket(\"ws://" << request.serverAddress().toString() << "/ws\");";
-        ostr << "    ws.onopen = function()";
-        ostr << "      {";
-        ostr << "        ws.send(\"Hello, world!\");";
-        ostr << "      };";
-        ostr << "    ws.onmessage = function(evt)";
-        ostr << "      { ";
-        ostr << "        var msg = evt.data;";
-        ostr << "        alert(\"Message received: \" + msg);";
-        ostr << "        ws.close();";
-        ostr << "      };";
-        ostr << "    ws.onclose = function()";
-        ostr << "      { ";
-        ostr << "        alert(\"WebSocket closed.\");";
-        ostr << "      };";
-        ostr << "  }";
-        ostr << "  else";
-        ostr << "  {";
-        ostr << "     alert(\"This browser does not support WebSockets.\");";
-        ostr << "  }";
-        ostr << "}";
-        ostr << "</script>";
-        ostr << "</head>";
-        ostr << "<body>";
-        ostr << "  <h1>WebSocket Server</h1>";
-        ostr << "  <p><a href=\"javascript:WebSocketTest()\">Run WebSocket Script</a></p>";
-        ostr << "</body>";
-        ostr << "</html>";
     }
-};
 
-
-class WebSocketRequestHandler: public HTTPRequestHandler
-    /// Handle a WebSocket connection.
-{
-public:
-    void handleRequest(HTTPServerRequest& request, HTTPServerResponse& response)
+    void run()
     {
         Application& app = Application::instance();
+        app.logger().information("Request from " + this->socket().peerAddress().toString());
         try
         {
-            WebSocket ws(request, response);
-            app.logger().information("WebSocket connection established.");
-            char buffer[1024];
-            int flags;
-            int n;
-            do
-            {
-                n = ws.receiveFrame(buffer, sizeof(buffer), flags);
-                app.logger().information(Poco::format("Frame received (length=%d, flags=0x%x).", n, unsigned(flags)));
-                ws.sendFrame(buffer, n, flags);
-            }
-            while (n > 0 && (flags & WebSocket::FRAME_OP_BITMASK) != WebSocket::FRAME_OP_CLOSE);
-            app.logger().information("WebSocket connection closed.");
+            Timestamp now;
+            std::string dt(DateTimeFormatter::format(now, _format));
+            dt.append("\r\n");
+            socket().sendBytes(dt.data(), (int) dt.length());
         }
-        catch (WebSocketException& exc)
+        catch (Poco::Exception& exc)
         {
             app.logger().log(exc);
-            switch (exc.code())
-            {
-                case WebSocket::WS_ERR_HANDSHAKE_UNSUPPORTED_VERSION:
-                    response.set("Sec-WebSocket-Version", WebSocket::WEBSOCKET_VERSION);
-                    // fallthrough
-                case WebSocket::WS_ERR_NO_HANDSHAKE:
-                case WebSocket::WS_ERR_HANDSHAKE_NO_VERSION:
-                case WebSocket::WS_ERR_HANDSHAKE_NO_KEY:
-                    response.setStatusAndReason(HTTPResponse::HTTP_BAD_REQUEST);
-                    response.setContentLength(0);
-                    response.send();
-                    break;
-            }
         }
     }
+
+private:
+    std::string _format;
 };
 
 
-class RequestHandlerFactory: public HTTPRequestHandlerFactory
+class TimeServerConnectionFactory: public TCPServerConnectionFactory
+    /// A factory for TimeServerConnection.
 {
 public:
-    HTTPRequestHandler* createRequestHandler(const HTTPServerRequest& request)
+    TimeServerConnectionFactory(const std::string& format):
+        _format(format)
     {
-        Application& app = Application::instance();
-        app.logger().information("Request from "
-                                 + request.clientAddress().toString()
-                                 + ": "
-                                 + request.getMethod()
-                                 + " "
-                                 + request.getURI()
-                                 + " "
-                                 + request.getVersion());
-
-        for (HTTPServerRequest::ConstIterator it = request.begin(); it != request.end(); ++it)
-        {
-            app.logger().information(it->first + ": " + it->second);
-        }
-
-        if(request.find("Upgrade") != request.end() && Poco::icompare(request["Upgrade"], "websocket") == 0)
-            return new WebSocketRequestHandler;
-        else
-            return new PageRequestHandler;
     }
+
+    TCPServerConnection* createConnection(const StreamSocket& socket)
+    {
+        return new TimeServerConnection(socket, _format);
+    }
+
+private:
+    std::string _format;
 };
 
 
-class WebSocketServer: public Poco::Util::ServerApplication
+class TimeServer: public Poco::Util::ServerApplication
     /// The main application class.
     ///
     /// This class handles command-line arguments and
     /// configuration files.
-    /// Start the WebSocketServer executable with the help
+    /// Start the TimeServer executable with the help
     /// option (/help on Windows, --help on Unix) for
     /// the available command line options.
     ///
-    /// To use the sample configuration file (WebSocketServer.properties),
-    /// copy the file to the directory where the WebSocketServer executable
-    /// resides. If you start the debug version of the WebSocketServer
-    /// (WebSocketServerd[.exe]), you must also create a copy of the configuration
-    /// file named WebSocketServerd.properties. In the configuration file, you
+    /// To use the sample configuration file (TimeServer.properties),
+    /// copy the file to the directory where the TimeServer executable
+    /// resides. If you start the debug version of the TimeServer
+    /// (TimeServerd[.exe]), you must also create a copy of the configuration
+    /// file named TimeServerd.properties. In the configuration file, you
     /// can specify the port on which the server is listening (default
-    /// 9980) and the format of the date/time string sent back to the client.
+    /// 9911) and the format of the date/time string sent back to the client.
     ///
-    /// To test the WebSocketServer you can use any web browser (http://localhost:9980/).
+    /// To test the TimeServer you can use any telnet client (telnet localhost 9911).
 {
 public:
-    WebSocketServer(): _helpRequested(false)
+    TimeServer(): _helpRequested(false)
     {
     }
 
-    ~WebSocketServer()
+    ~TimeServer()
     {
     }
 
@@ -232,7 +158,7 @@ protected:
         HelpFormatter helpFormatter(options());
         helpFormatter.setCommand(commandName());
         helpFormatter.setUsage("OPTIONS");
-        helpFormatter.setHeader("A sample HTTP server supporting the WebSocket protocol.");
+        helpFormatter.setHeader("A server application that serves the current date and time.");
         helpFormatter.format(std::cout);
     }
 
@@ -245,17 +171,18 @@ protected:
         else
         {
             // get parameters from configuration file
-            unsigned short port = (unsigned short) config().getInt("WebSocketServer.port", 9980);
+            unsigned short port = (unsigned short) config().getInt("TimeServer.port", 9911);
+            std::string format(config().getString("TimeServer.format", DateTimeFormat::ISO8601_FORMAT));
 
             // set-up a server socket
             ServerSocket svs(port);
-            // set-up a HTTPServer instance
-            HTTPServer srv(new RequestHandlerFactory, svs, new HTTPServerParams);
-            // start the HTTPServer
+            // set-up a TCPServer instance
+            TCPServer srv(new TimeServerConnectionFactory(format), svs);
+            // start the TCPServer
             srv.start();
             // wait for CTRL-C or kill
             waitForTerminationRequest();
-            // Stop the HTTPServer
+            // Stop the TCPServer
             srv.stop();
         }
         return Application::EXIT_OK;
@@ -268,14 +195,6 @@ private:
 
 int main(int argc, char** argv)
 {
-    try
-    {
-        WebSocketServer app;
-        return app.run(argc, argv);
-    }
-    catch (Poco::Exception& exc)
-    {
-        std::cerr << exc.displayText() << std::endl;
-        return Poco::Util::Application::EXIT_SOFTWARE;
-    }
+    TimeServer app;
+    return app.run(argc, argv);
 }

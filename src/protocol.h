@@ -6,3 +6,13 @@
 #define PROJECT_PROTOCOL_H
 
 #endif //PROJECT_PROTOCOL_H
+
+#include <mysql_com.h>
+
+namespace Protocol {
+
+    class HandshakeV10 {
+
+    };
+
+}
