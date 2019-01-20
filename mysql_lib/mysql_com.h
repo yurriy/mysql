@@ -44,11 +44,13 @@
   it, but on the server side, we need to get it from a header.
 */
 #ifndef my_socket_defined
-#include "my_io.h"
+//#include "my_io.h"
 #endif
 
 #ifndef MYSQL_ABI_CHECK
 #include <stdbool.h>
+#include <cstdio>
+
 #endif
 
 #define HOSTNAME_LENGTH 60
@@ -827,7 +829,7 @@ struct Vio;
 typedef struct NET {
     MYSQL_VIO vio;
     unsigned char *buff, *buff_end, *write_pos, *read_pos;
-    my_socket fd; /* For Perl DBI/dbd */
+//    my_socket fd; /* For Perl DBI/dbd */
     /**
       Set if we are doing several queries in one
       command ( as in LOAD TABLE ... FROM MASTER ),
@@ -1008,7 +1010,7 @@ struct rand_struct {
 };
 
 /* Include the types here so existing UDFs can keep compiling */
-#include <mysql/udf_registration_types.h>
+//#include <mysql/udf_registration_types.h>
 
 /**
   @addtogroup group_cs_compresson_constants Constants when using compression
