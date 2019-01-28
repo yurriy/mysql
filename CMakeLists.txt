@@ -7,7 +7,7 @@ add_subdirectory(poco)
 set( Poco_DIR poco/Poco )
 find_package( Poco REQUIRED COMPONENTS NetSSL Util JSON XML Foundation CONFIG )
 
-add_executable( a.out src/main.cpp src/protocol.cpp src/protocol.h )
+add_executable( a.out src/main.cpp src/protocol.h)
 
 target_include_directories( a.out PRIVATE mysql_lib )
 

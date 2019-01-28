@@ -25,6 +25,8 @@
 #include "Poco/Util/OptionSet.h"
 #include "Poco/Util/HelpFormatter.h"
 #include <iostream>
+#include <cstring>
+#include "protocol.h"
 
 
 using Poco::Net::ServerSocket;
@@ -42,28 +44,111 @@ using Poco::Util::OptionSet;
 using Poco::Util::HelpFormatter;
 
 
-class TimeServerConnection: public TCPServerConnection
+class NetError : public std::exception {
+    std::string error;
+public:
+    NetError(const std::string& error) : error(error) {
+    }
+    const char* what() {
+        return error.c_str();
+    }
+};
+
+class MySQLServerConnection: public TCPServerConnection
     /// This class handles all client connections.
-    ///
-    /// A string with the current date and time is sent back to the client.
 {
 public:
-    TimeServerConnection(const StreamSocket& s, const std::string& format):
+    MySQLServerConnection(const StreamSocket& s, const uint32_t connection_id):
         TCPServerConnection(s),
-        _format(format)
+        connection_id(connection_id),
+        app(Application::instance())
     {
+    }
+
+    std::string toText(std::string packet) {
+        std::string result;
+        for (std::string::value_type c : packet) {
+            result.append(std::to_string((unsigned char) c));
+            result.append(1, ' ');
+        }
+        return result;
+    }
+
+    void sendBuf(const char *buf, size_t size) {
+        int cur = 0;
+        while (cur != size) {
+            int res = socket().sendBytes(buf + cur, (int) size);
+            if (res == -1) {
+                throw NetError(std::string("error on send: ") + strerror(errno) + " cur: " + std::to_string(cur));
+            }
+            app.logger().information(std::string("sent ") + std::to_string(res) + " bytes");
+            cur += res;
+        }
+    }
+
+    void receiveBuf(char *buf, size_t size) {
+        int cur = 0;
+        while (cur != size) {
+            int res = socket().receiveBytes(buf + cur, (int) (size - cur));
+            if (res == -1) {
+                throw NetError(std::string("error on receive: ") + strerror(errno) + " cur: " + std::to_string(cur));
+            }
+            else if (res == 0) {
+                throw NetError("unexpected end of stream");
+            }
+            cur += res;
+            app.logger().information(std::string("received ") + std::to_string(res) + " bytes");
+        }
+    }
+
+    Protocol::Packet receivePacket() {
+        std::string header;
+        header.resize(4);
+        receiveBuf(header.data(), header.length());
+
+        Protocol::Packet packet;
+        packet.readHeader(header);
+        app.logger().information("parsed packet_length: " + std::to_string(packet.payload_length));
+        app.logger().information("parsed sequence_id: " + std::to_string(packet.sequence_id));
+
+        packet.payload.resize(packet.payload_length);
+        receiveBuf(packet.payload.data(), packet.payload_length);
+
+        app.logger().information(std::string("handshake response ") + toText(packet.payload));
+        return packet;
     }
 
     void run()
     {
-        Application& app = Application::instance();
         app.logger().information("Request from " + this->socket().peerAddress().toString());
         try
         {
-            Timestamp now;
-            std::string dt(DateTimeFormatter::format(now, _format));
-            dt.append("\r\n");
-            socket().sendBytes(dt.data(), (int) dt.length());
+            Protocol::HandshakeV10 handshakeV10(connection_id);
+            auto payload = handshakeV10.get_payload();
+            std::string packet;
+            int size = (int) payload.size();
+            packet.append((const char *) &size, 3);
+            packet.append(1, 0);  // sequence_id
+            packet.append(payload);
+            app.logger().information(std::string("packet: ") + toText(packet));
+            sendBuf(packet.data(), packet.length());
+            app.logger().information("sent handshake");
+
+            auto handshake_response_packet = receivePacket();
+            Protocol::HandshakeResponse41 handshakeResponse41;
+            handshakeResponse41.read_payload(handshake_response_packet.payload);
+
+            Protocol::OK_Packet ok_packet(0, handshakeResponse41.capability_flags, 0, 0, 0, "");
+            payload = ok_packet.get_payload();
+            size = (int) payload.size();
+
+            packet.clear();
+            packet.append((const char *) &size, 3);
+            packet.append(1, 2);  // sequence_id
+            packet.append(payload);
+            app.logger().information(std::string("packet: ") + toText(packet));
+            sendBuf(packet.data(), packet.length());
+            app.logger().information("sent OK_Packet");
         }
         catch (Poco::Exception& exc)
         {
@@ -72,7 +157,8 @@ public:
     }
 
 private:
-    std::string _format;
+    const uint32_t connection_id;
+    Application& app;
 };
 
 
@@ -87,13 +173,15 @@ public:
 
     TCPServerConnection* createConnection(const StreamSocket& socket)
     {
-        return new TimeServerConnection(socket, _format);
+        return new MySQLServerConnection(socket, last_connection_id++);
     }
 
 private:
     std::string _format;
+    static uint32_t last_connection_id;
 };
 
+uint32_t TimeServerConnectionFactory::last_connection_id = 0;
 
 class TimeServer: public Poco::Util::ServerApplication
     /// The main application class.
