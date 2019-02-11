@@ -50,4 +50,9 @@ namespace Protocol {
         }
         return result;
     }
+
+    void write_lenenc_str(std::string& payload, const std::string& s) {
+        payload.append(write_lenenc(s.length()));
+        payload.append(s);
+    }
 }

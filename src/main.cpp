@@ -14,6 +14,7 @@
 #include "Poco/Net/TCPServerConnection.h"
 #include "Poco/Net/TCPServerConnectionFactory.h"
 #include "Poco/Net/TCPServerParams.h"
+#include "Poco/Net/SocketAddress.h"
 #include "Poco/Net/StreamSocket.h"
 #include "Poco/Net/ServerSocket.h"
 #include "Poco/Timestamp.h"
@@ -27,7 +28,7 @@
 #include <iostream>
 #include <cstring>
 #include "protocol.h"
-
+#include "exceptions.h"
 
 using Poco::Net::ServerSocket;
 using Poco::Net::StreamSocket;
@@ -44,15 +45,7 @@ using Poco::Util::OptionSet;
 using Poco::Util::HelpFormatter;
 
 
-class NetError : public std::exception {
-    std::string error;
-public:
-    NetError(const std::string& error) : error(error) {
-    }
-    const char* what() {
-        return error.c_str();
-    }
-};
+
 
 class MySQLServerConnection: public TCPServerConnection
     /// This class handles all client connections.
@@ -65,13 +58,18 @@ public:
     {
     }
 
-    std::string toText(std::string packet) {
+    std::string toText(const std::string& packet) {
         std::string result;
         for (std::string::value_type c : packet) {
             result.append(std::to_string((unsigned char) c));
             result.append(1, ' ');
         }
         return result;
+    }
+
+    void sendStr(const std::string& s) {
+        app.logger().information(std::string("send packet: ") + toText(s));
+        sendBuf(s.data(), s.length());
     }
 
     void sendBuf(const char *buf, size_t size) {
@@ -106,15 +104,14 @@ public:
         header.resize(4);
         receiveBuf(header.data(), header.length());
 
-        Protocol::Packet packet;
-        packet.readHeader(header);
+        Protocol::Packet packet(header);
         app.logger().information("parsed packet_length: " + std::to_string(packet.payload_length));
         app.logger().information("parsed sequence_id: " + std::to_string(packet.sequence_id));
 
-        packet.payload.resize(packet.payload_length);
-        receiveBuf(packet.payload.data(), packet.payload_length);
+        packet.allocatePayload();
+        receiveBuf(packet.getPayload().data(), packet.getPayloadLength());
 
-        app.logger().information(std::string("handshake response ") + toText(packet.payload));
+        app.logger().information(std::string("payload ") + toText(packet.getPayload()));
         return packet;
     }
 
@@ -124,31 +121,44 @@ public:
         try
         {
             Protocol::HandshakeV10 handshakeV10(connection_id);
-            auto payload = handshakeV10.get_payload();
-            std::string packet;
-            int size = (int) payload.size();
-            packet.append((const char *) &size, 3);
-            packet.append(1, 0);  // sequence_id
-            packet.append(payload);
-            app.logger().information(std::string("packet: ") + toText(packet));
-            sendBuf(packet.data(), packet.length());
+            auto payload = handshakeV10.getPayload();
+            Protocol::Packet packet(0, payload);
+            sendStr(packet.toString());
             app.logger().information("sent handshake");
 
             auto handshake_response_packet = receivePacket();
             Protocol::HandshakeResponse41 handshakeResponse41;
-            handshakeResponse41.read_payload(handshake_response_packet.payload);
+            handshakeResponse41.readPayload(handshake_response_packet.payload);
+            capabilities = handshakeResponse41.capability_flags;
 
             Protocol::OK_Packet ok_packet(0, handshakeResponse41.capability_flags, 0, 0, 0, "");
-            payload = ok_packet.get_payload();
-            size = (int) payload.size();
-
-            packet.clear();
-            packet.append((const char *) &size, 3);
-            packet.append(1, 2);  // sequence_id
-            packet.append(payload);
-            app.logger().information(std::string("packet: ") + toText(packet));
-            sendBuf(packet.data(), packet.length());
+            payload = ok_packet.getPayload();
+            packet = Protocol::Packet(2, payload);
+            sendStr(packet.toString());
             app.logger().information("sent OK_Packet");
+
+            while (true) {
+                auto p = receivePacket();
+                sequence_id = p.sequence_id + 1;
+                app.logger().information(std::string("received command: ") + std::to_string(p.getCommandByte()));
+                switch (p.getCommandByte()) {
+                    case Protocol::COM_QUIT:
+                        app.logger().information(std::string("client ") + std::to_string(connection_id) + " quited");
+                        return;
+                    case Protocol::COM_QUERY:
+                        executeQuery(p);
+                        break;
+                    case Protocol::COM_FIELD_LIST:
+                        sendFieldsList();
+                        break;
+                    case Protocol::COM_PING:
+                        respondPing();
+                        break;
+                    default:
+                        app.logger().error(std::string("Cannot handle command: ") + std::to_string(p.getCommandByte()));
+                        return;
+                }
+            }
         }
         catch (Poco::Exception& exc)
         {
@@ -156,32 +166,93 @@ public:
         }
     }
 
+    void sendFieldsList() {
+
+        Protocol::ColumnDefinition41 column1(
+            "schema", "table", "table", "name", "name",
+            63, 100, Protocol::ColumnType::MYSQL_TYPE_STRING, 0, 0);
+        Protocol::ColumnDefinition41 column2(
+            "schema", "table", "table", "index", "index",
+            63, 8, Protocol::ColumnType::MYSQL_TYPE_LONG, 0, 0);
+
+        sendStr(Protocol::Packet(sequence_id++, column1.getPayload()).toString());
+        sendStr(Protocol::Packet(sequence_id++, column2.getPayload()).toString());
+
+        sendStr(Protocol::Packet(sequence_id++, Protocol::EOF_Packet(0, 0).getPayload()).toString());
+
+    }
+
+    void respondPing() {
+        sendStr(Protocol::Packet(sequence_id++, Protocol::OK_Packet(0x0, capabilities, 0, 0, 0, "").getPayload()).toString());
+    }
+
+    void sendResultSet() {
+
+        size_t column_count = 2;
+        Protocol::Packet packet(sequence_id++, Protocol::write_lenenc(column_count));
+        sendStr(packet.toString());
+
+        Protocol::ColumnDefinition41 column1(
+            "schema", "table", "table", "name", "name",
+            63, 100, Protocol::ColumnType::MYSQL_TYPE_STRING, 0, 0);
+        Protocol::ColumnDefinition41 column2(
+            "schema", "table", "table", "index", "index",
+            63, 8, Protocol::ColumnType::MYSQL_TYPE_LONG, 0, 0);
+
+        sendStr(Protocol::Packet(sequence_id++, column1.getPayload()).toString());
+        sendStr(Protocol::Packet(sequence_id++, column2.getPayload()).toString());
+
+        if (!(capabilities & Protocol::CLIENT_DEPRECATE_EOF)) {
+            sendStr(Protocol::Packet(sequence_id++, Protocol::EOF_Packet(0, 0).getPayload()).toString());
+        }
+
+        std::string row1, row2;
+        Protocol::write_lenenc_str(row1, "user1");
+        Protocol::write_lenenc_str(row1, "100");
+        Protocol::write_lenenc_str(row2, "user2");
+        Protocol::write_lenenc_str(row2, "200");
+
+        sendStr(Protocol::Packet(sequence_id++, row1).toString());
+        sendStr(Protocol::Packet(sequence_id++, row2).toString());
+
+        std::string payload;
+        if (capabilities & Protocol::CLIENT_DEPRECATE_EOF) {
+            sendStr(Protocol::Packet(sequence_id++, Protocol::OK_Packet(0xfe, capabilities, 0, 0, 0, "").getPayload()).toString());
+        } else {
+            sendStr(Protocol::Packet(sequence_id++, Protocol::EOF_Packet(0, 0).getPayload()).toString());
+        }
+    }
+
+    void executeQuery(Protocol::Packet& packet) {
+        app.logger().information(std::string("executing query: ") + packet.getPayload().substr(1));
+        sendResultSet();
+    }
+
 private:
     const uint32_t connection_id;
+    uint32_t capabilities;
+    int sequence_id = 0;
     Application& app;
 };
 
 
-class TimeServerConnectionFactory: public TCPServerConnectionFactory
+class MySQLServerConnectionFactory: public TCPServerConnectionFactory
     /// A factory for TimeServerConnection.
 {
 public:
-    TimeServerConnectionFactory(const std::string& format):
-        _format(format)
-    {
+    MySQLServerConnectionFactory() {
     }
 
-    TCPServerConnection* createConnection(const StreamSocket& socket)
+    TCPServerConnection* createConnection(const StreamSocket& socket) override
     {
         return new MySQLServerConnection(socket, last_connection_id++);
     }
 
 private:
-    std::string _format;
     static uint32_t last_connection_id;
 };
 
-uint32_t TimeServerConnectionFactory::last_connection_id = 0;
+uint32_t MySQLServerConnectionFactory::last_connection_id = 0;
 
 class TimeServer: public Poco::Util::ServerApplication
     /// The main application class.
@@ -258,14 +329,8 @@ protected:
         }
         else
         {
-            // get parameters from configuration file
-            unsigned short port = (unsigned short) config().getInt("TimeServer.port", 9911);
-            std::string format(config().getString("TimeServer.format", DateTimeFormat::ISO8601_FORMAT));
-
-            // set-up a server socket
-            ServerSocket svs(port);
             // set-up a TCPServer instance
-            TCPServer srv(new TimeServerConnectionFactory(format), svs);
+            TCPServer srv(new MySQLServerConnectionFactory(), Poco::Net::SocketAddress("ocelot.search.yandex.net", 9911));
             // start the TCPServer
             srv.start();
             // wait for CTRL-C or kill

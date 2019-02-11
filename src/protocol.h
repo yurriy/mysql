@@ -17,6 +17,7 @@
 
 #include "Poco/Util/Application.h"
 #include "basic_types.h"
+#include "exceptions.h"
 
 #define SCRAMBLE_LENGTH 20
 #define AUTH_PLUGIN_DATA_PART_1_LENGTH 8
@@ -37,7 +38,60 @@ namespace Protocol {
         CLIENT_SESSION_TRACK = 0x00800000, // TODO
         CLIENT_SECURE_CONNECTION = 0x00008000,
         CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA = 0x00200000,
-        CLIENT_PLUGIN_AUTH = 0x00080000
+        CLIENT_PLUGIN_AUTH = 0x00080000,
+        CLIENT_DEPRECATE_EOF = 0x01000000,
+    };
+
+    enum Command {
+        COM_SLEEP = 0x0,
+        COM_QUIT = 0x1,
+        COM_INIT_DB = 0x2,
+        COM_QUERY = 0x3,
+        COM_FIELD_LIST = 0x4,
+        COM_CREATE_DB = 0x5,
+        COM_DROP_DB = 0x6,
+        COM_REFRESH = 0x7,
+        COM_SHUTDOWN = 0x8,
+        COM_STATISTICS = 0x9,
+        COM_PROCESS_INFO = 0xa,
+        COM_CONNECT = 0xb,
+        COM_PROCESS_KILL = 0xc,
+        COM_DEBUG = 0xd,
+        COM_PING = 0xe,
+        COM_TIME = 0xf,
+        COM_DELAYED_INSERT = 0x10,
+        COM_CHANGE_USER = 0x11,
+        COM_RESET_CONNECTION = 0x1f,
+        COM_DAEMON = 0x1d
+    };
+
+    enum ColumnType {
+         MYSQL_TYPE_DECIMAL = 0x00,
+         MYSQL_TYPE_TINY = 0x01,
+         MYSQL_TYPE_SHORT = 0x02,
+         MYSQL_TYPE_LONG = 0x03,
+         MYSQL_TYPE_FLOAT = 0x04,
+         MYSQL_TYPE_DOUBLE = 0x05,
+         MYSQL_TYPE_NULL = 0x06,
+         MYSQL_TYPE_TIMESTAMP = 0x07,
+         MYSQL_TYPE_LONGLONG = 0x08,
+         MYSQL_TYPE_INT24 = 0x09,
+         MYSQL_TYPE_DATE = 0x0a,
+         MYSQL_TYPE_TIME = 0x0b,
+         MYSQL_TYPE_DATETIME = 0x0c,
+         MYSQL_TYPE_YEAR = 0x0d,
+         MYSQL_TYPE_VARCHAR = 0x0f,
+         MYSQL_TYPE_BIT = 0x10,
+         MYSQL_TYPE_NEWDECIMAL = 0xf6,
+         MYSQL_TYPE_ENUM = 0xf7,
+         MYSQL_TYPE_SET = 0xf8,
+         MYSQL_TYPE_TINY_BLOB = 0xf9,
+         MYSQL_TYPE_MEDIUM_BLOB = 0xfa,
+         MYSQL_TYPE_LONG_BLOB = 0xfb,
+         MYSQL_TYPE_BLOB = 0xfc,
+         MYSQL_TYPE_VAR_STRING = 0xfd,
+         MYSQL_TYPE_STRING = 0xfe,
+         MYSQL_TYPE_GEOMETRY = 0xff
     };
 
     class Packet {
@@ -46,9 +100,42 @@ namespace Protocol {
         int sequence_id;
         std::string payload;
 
-        void readHeader(std::string s) {
-            payload_length = (*(uint32_t *) s.data()) & 0xffffff;
-            sequence_id = *((uint8_t *) s.data() + 3);
+        Packet(int sequence_id, const std::string& payload)
+            : sequence_id(sequence_id)
+            , payload(payload)
+            , payload_length(payload.length()) {
+        }
+
+        explicit Packet(std::string& header) {
+            payload_length = (*(uint32_t *) header.data()) & 0xffffff;
+            sequence_id = *((uint8_t *) header.data() + 3);
+        }
+
+        void allocatePayload() {
+            payload.resize(payload_length);
+        }
+
+        std::string& getPayload() {
+            return payload;
+        }
+
+        size_t getPayloadLength() {
+            return payload_length;
+        }
+
+        int getCommandByte() {
+            if (payload.length() == 0) {
+                throw ProtocolError("payload is empty, cannot get command byte");
+            }
+            return (int) payload[0];
+        }
+
+        std::string toString() {
+            std::string result;
+            result.append((const char *) &payload_length, 3);
+            result.append((const char *) &sequence_id, 1);
+            result.append(payload);
+            return result;
         }
     };
 
@@ -65,8 +152,13 @@ namespace Protocol {
             : protocol_version(0xa)
             , server_version("1")
             , connection_id(connection_id)
-            , capability_flags(CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH
-                | CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA | CLIENT_CONNECT_WITH_DB)
+            , capability_flags(
+                CLIENT_PROTOCOL_41
+                | CLIENT_SECURE_CONNECTION
+                | CLIENT_PLUGIN_AUTH
+                | CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA
+                | CLIENT_CONNECT_WITH_DB
+                | CLIENT_DEPRECATE_EOF)
             , character_set(63)
             , status_flags(0) {
             auth_plugin_data.resize(SCRAMBLE_LENGTH);
@@ -80,7 +172,7 @@ namespace Protocol {
             }
         }
 
-        std::string get_payload() {
+        std::string getPayload() {
             std::string result;
             result.append(1, protocol_version);
             result.append(server_version);
@@ -112,7 +204,7 @@ namespace Protocol {
         std::string database;
         std::string auth_plugin_name;
 
-        void read_payload(std::string& s) {
+        void readPayload(std::string &s) {
             auto& logger = Poco::Util::Application::instance().logger();
             std::istringstream ss(s);
             ss.readsome((char *) &capability_flags, 4);
@@ -173,7 +265,7 @@ namespace Protocol {
         {
         }
 
-        std::string get_payload() {
+        std::string getPayload() {
             std::string result;
             result.append(1, header);
             result.append(write_lenenc(affected_rows));
@@ -196,6 +288,78 @@ namespace Protocol {
             } else {
                 result.append(info);
             }
+            return result;
+        }
+    };
+
+    class EOF_Packet {
+        int warnings;
+        int status_flags;
+    public:
+        EOF_Packet(int warnings, int status_flags): warnings(warnings), status_flags(status_flags) {}
+
+        std::string getPayload() {
+            std::string result;
+            result.append(1, 0xfe); // EOF header
+            result.append((const char *) &warnings, 2);
+            result.append((const char *) &status_flags, 2);
+            return result;
+        }
+    };
+
+    class ColumnDefinition41 {
+        std::string schema;
+        std::string table;
+        std::string org_table;
+        std::string name;
+        std::string org_name;
+        size_t next_length = 0x0c;
+        uint16_t character_set;
+        uint32_t column_length;
+        ColumnType column_type;
+        uint16_t flags;
+        uint8_t decimals = 0x00;
+    public:
+        explicit ColumnDefinition41(
+            const std::string& schema,
+            const std::string& table,
+            const std::string& org_table,
+            const std::string& name,
+            const std::string& org_name,
+            uint16_t character_set,
+            uint32_t column_length,
+            ColumnType column_type,
+            uint16_t flags,
+            uint8_t decimals)
+
+            : schema(schema)
+            , table(table)
+            , org_table(org_table)
+            , name(name)
+            , org_name(org_name)
+            , character_set(character_set)
+            , column_length(column_length)
+            , column_type(column_type)
+            , flags(flags)
+            , decimals(decimals)
+            {
+        }
+
+        std::string getPayload() {
+            std::string result;
+            write_lenenc_str(result, "def"); // always "def"
+            write_lenenc_str(result, schema);
+            write_lenenc_str(result, table);
+            write_lenenc_str(result, org_table);
+            write_lenenc_str(result, name);
+            write_lenenc_str(result, org_name);
+            result.append(write_lenenc(next_length));
+            result.append((const char *) &character_set, 2);
+            result.append((const char *) &column_length, 4);
+            result.append((const char *) &column_type, 1);
+            result.append((const char *) &flags, 2);
+            result.append((const char *) &decimals, 2);
+            result.append(2, 0x0);
             return result;
         }
     };
